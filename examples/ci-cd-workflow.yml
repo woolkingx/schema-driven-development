@@ -1,0 +1,360 @@
+# Schema-Driven Development CI/CD Workflow
+# 完整的 GitHub Actions 配置範例
+
+name: Schema-Driven API CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  RUST_TOOLCHAIN: stable
+  NODE_VERSION: '20'
+
+jobs:
+  # Job 1: Schema Validation
+  schema-validation:
+    name: Validate Schemas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Schema Tools
+        run: |
+          npm install -g ajv-cli @stoplight/spectral-cli @adobe/jsonschema2md
+
+      - name: Validate Schema Syntax
+        run: |
+          echo "🔍 Validating JSON Schema syntax..."
+          ajv compile -s schemas/current/*.json --strict=false
+
+      - name: Lint Schemas with Spectral
+        run: |
+          echo "🎨 Linting schemas..."
+          spectral lint schemas/current/*.json --ruleset .spectral.yml || true
+
+      - name: Validate Examples
+        run: |
+          echo "📝 Validating example data..."
+          for schema in schemas/current/*.json; do
+            schema_name=$(basename "$schema" .schema.json)
+            if [ -f "examples/${schema_name}.valid.json" ]; then
+              ajv validate -s "$schema" -d "examples/${schema_name}.valid.json"
+            fi
+          done
+
+      - name: Generate Documentation
+        run: |
+          echo "📚 Generating schema documentation..."
+          jsonschema2md -d schemas/current/ -o docs/schemas/
+
+      - name: Upload Documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-docs
+          path: docs/schemas/
+
+  # Job 2: Check Backward Compatibility
+  backward-compatibility:
+    name: Check Breaking Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for comparison
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Diff Tools
+        run: npm install -g @apidevtools/json-schema-diff
+
+      - name: Check for Breaking Changes
+        run: |
+          echo "🔍 Checking for breaking changes..."
+
+          # Get list of changed schema files
+          CHANGED_SCHEMAS=$(git diff --name-only origin/main...HEAD | grep 'schemas/current/.*\.json' || true)
+
+          if [ -z "$CHANGED_SCHEMAS" ]; then
+            echo "No schema changes detected"
+            exit 0
+          fi
+
+          # Check each changed schema
+          for schema in $CHANGED_SCHEMAS; do
+            echo "Checking $schema..."
+
+            # Get the old version
+            git show origin/main:$schema > /tmp/old-schema.json
+
+            # Compare with new version
+            json-schema-diff /tmp/old-schema.json $schema || {
+              echo "⚠️ Breaking changes detected in $schema"
+              exit 1
+            }
+          done
+
+          echo "✅ No breaking changes detected"
+
+  # Job 3: Rust Backend Tests
+  rust-tests:
+    name: Rust Contract Tests
+    runs-on: ubuntu-latest
+    needs: schema-validation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Unit Tests
+        run: cargo test --lib
+
+      - name: Run Contract Tests
+        run: cargo test --test contract_tests
+
+      - name: Run Integration Tests
+        run: cargo test --test integration_tests
+
+      - name: Check Code Coverage
+        run: |
+          cargo install cargo-tarpaulin
+          cargo tarpaulin --out Xml --output-dir coverage/
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage/cobertura.xml
+
+  # Job 4: Frontend Type Generation & Tests
+  frontend-tests:
+    name: Frontend TypeScript Tests
+    runs-on: ubuntu-latest
+    needs: schema-validation
+    defaults:
+      run:
+        working-directory: ./frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Generate TypeScript Types
+        run: |
+          echo "🔧 Generating TypeScript types from schemas..."
+          npm run generate-types
+
+      - name: Type Check
+        run: npm run type-check
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Run E2E Tests
+        run: npm run test:e2e
+
+  # Job 5: Generate OpenAPI Specification
+  openapi-generation:
+    name: Generate OpenAPI Spec
+    runs-on: ubuntu-latest
+    needs: schema-validation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Tools
+        run: |
+          npm install -g @apidevtools/swagger-cli
+          npm install -g @redocly/cli
+
+      - name: Bundle OpenAPI Spec
+        run: |
+          echo "📦 Bundling OpenAPI specification..."
+          swagger-cli bundle openapi.yaml --outfile dist/openapi.json
+          swagger-cli validate dist/openapi.json
+
+      - name: Generate API Documentation
+        run: |
+          echo "📚 Generating API documentation..."
+          redocly build-docs dist/openapi.json --output dist/api-docs.html
+
+      - name: Upload OpenAPI Spec
+        uses: actions/upload-artifact@v4
+        with:
+          name: openapi-spec
+          path: dist/
+
+  # Job 6: Contract Testing (Specmatic/Pact)
+  contract-testing:
+    name: Contract Testing
+    runs-on: ubuntu-latest
+    needs: [rust-tests, frontend-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java (for Specmatic)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Run Specmatic Contract Tests
+        run: |
+          echo "🤝 Running contract tests..."
+          docker run --rm \
+            -v $(pwd)/schemas:/schemas \
+            -v $(pwd)/examples:/examples \
+            znsio/specmatic test \
+            --specs /schemas/current/*.json
+
+  # Job 7: Security Scanning
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run 42Crunch API Security Audit
+        uses: 42Crunch/api-security-audit-action@v3
+        with:
+          api-token: ${{ secrets.API42_TOKEN }}
+          platform-url: https://platform.42crunch.com
+          default-collection-name: My API Collection
+          upload-to-code-scanning: true
+
+      - name: Scan for Secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+
+  # Job 8: Build & Deploy (Production)
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    needs: [rust-tests, frontend-tests, contract-testing]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Rust Backend
+        run: cargo build --release
+
+      - name: Build Frontend
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Deploy to Production
+        run: |
+          echo "🚀 Deploying to production..."
+          # Add your deployment script here
+
+      - name: Publish API Documentation
+        run: |
+          echo "📚 Publishing API documentation..."
+          # Deploy docs to GitHub Pages or similar
+
+  # Job 9: Performance Benchmarks
+  performance:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Benchmarks
+        run: cargo bench
+
+      - name: Store Benchmark Results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'cargo'
+          output-file-path: target/criterion/output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+
+  # Job 10: Notification
+  notify:
+    name: Notify Results
+    runs-on: ubuntu-latest
+    needs: [schema-validation, rust-tests, frontend-tests, deploy]
+    if: always()
+    steps:
+      - name: Check Job Status
+        run: |
+          if [[ "${{ needs.deploy.result }}" == "success" ]]; then
+            echo "✅ Deployment successful!"
+          else
+            echo "❌ Deployment failed!"
+          fi
+
+      - name: Send Slack Notification
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: ${{ job.status }}
+          text: |
+            Schema-Driven API CI/CD Pipeline
+            Schema Validation: ${{ needs.schema-validation.result }}
+            Rust Tests: ${{ needs.rust-tests.result }}
+            Frontend Tests: ${{ needs.frontend-tests.result }}
+            Deploy: ${{ needs.deploy.result }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+# Cron job for daily schema validation
+  scheduled-validation:
+    name: Daily Schema Validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate All Schemas
+        run: |
+          npm install -g ajv-cli
+          ajv compile -s schemas/**/*.json
+
+      - name: Check for Deprecated Features
+        run: |
+          echo "🔍 Checking for deprecated schema features..."
+          # Add custom deprecation checks here
